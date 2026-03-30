@@ -13,11 +13,15 @@ The **HR Recruitment & Management System** digitizes the entire journey of a tal
 3.  **Interviewing**: Scheduling and tracking interview outcomes (Pass/Fail).
 4.  **Hiring**: Generating salary offers and contract templates.
 5.  **Training**: Managing orientation and training progress for new hires.
+
+
+
 6.  **Employment**: Converting successful trainees into full-time employees with automated payroll and complaint tracking.
 
 ---
 
 ## 🖼️ Animated Preview
+https://github.com/user-attachments/assets/839da6dd-5f95-4016-982d-e40c692150c7
 <p align="center">
   <video src="screenshots/hr_demo.mp4" width="100%" autoplay loop muted></video>
 </p>
