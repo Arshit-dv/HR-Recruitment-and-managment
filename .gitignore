@@ -1,0 +1,26 @@
+# Node.js
+node_modules/
+dist/
+build/
+.env
+
+# Storage
+storage/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+*.log
+npm-debug.log*
+
+# Database check scripts (wiped)
+backend/check_*.js
+backend/test_*.js
+backend/debug*.js
+backend/alter_db.js
+backend/clean_db.js
+backend/seed.js
+backend/list_tables.js
+backend/check_ec_mapping.js
+backend/check_employee_table.js

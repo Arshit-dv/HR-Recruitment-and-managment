@@ -1,0 +1,210 @@
+const pool = require('../config/db');
+
+/* Helper: get next auto-ID since tables have no AUTO_INCREMENT */
+const nextID = async (table, pkCol) => {
+  const [[row]] = await pool.query(`SELECT COALESCE(MAX(${pkCol}), 0) + 1 AS n FROM ${table}`);
+  return row.n;
+};
+
+// POST /api/applications  — public
+// Body: { PreferredRole, Qualification, Specialization, YearsOfExperience, Skills[], Projects[] }
+const submitApplication = async (req, res, next) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const { FirstName, LastName, PreferredRole, Qualification, Specialization, YearsOfExperience, Skills = [], Projects = [] } = req.body;
+    if (!PreferredRole || !Qualification || !FirstName || !LastName) {
+      return res.status(400).json({ success: false, message: 'FirstName, LastName, Role and Qualification are required' });
+    }
+
+    const AppID = await nextID('application', 'ApplicationID');
+    const today = new Date().toISOString().split('T')[0];
+
+    await conn.query('INSERT INTO application (ApplicationID, FirstName, LastName, PreferredRole, ApplicationDate) VALUES (?, ?, ?, ?, ?)', [AppID, FirstName, LastName, PreferredRole, today]);
+    await conn.query('INSERT INTO resume (ApplicationID, Qualification, Specialization, YearsOfExperience) VALUES (?, ?, ?, ?)', [AppID, Qualification, Specialization || null, YearsOfExperience || null]);
+
+    for (const skill of Skills.filter(Boolean)) {
+      await conn.query('INSERT INTO resumeskills (ApplicationID, Skill) VALUES (?, ?)', [AppID, skill]);
+    }
+    for (const project of Projects.filter(Boolean)) {
+      await conn.query('INSERT INTO resumeprojects (ApplicationID, Project) VALUES (?, ?)', [AppID, project]);
+    }
+
+    await conn.commit();
+    res.status(201).json({ success: true, message: 'Application submitted!', ApplicationID: AppID });
+  } catch (err) {
+    await conn.rollback();
+    next(err);
+  } finally {
+    conn.release();
+  }
+};
+
+// GET /api/applications  — HR
+const getAllApplications = async (req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT a.ApplicationID, a.FirstName, a.LastName, a.PreferredRole, a.ApplicationDate,
+              MAX(r.Qualification) AS Qualification, MAX(r.Specialization) AS Specialization, MAX(r.YearsOfExperience) AS YearsOfExperience,
+              GROUP_CONCAT(DISTINCT rs.Skill ORDER BY rs.Skill SEPARATOR ', ') AS Skills,
+              GROUP_CONCAT(DISTINCT rp.Project ORDER BY rp.Project SEPARATOR ', ')  AS Projects,
+              MAX(s.ApplicationID) AS HasCandidate,
+              MAX(s.ScreeningStatus) AS ScreeningStatus
+       FROM application a
+       LEFT JOIN resume r         ON a.ApplicationID = r.ApplicationID
+       LEFT JOIN resumeskills rs   ON a.ApplicationID = rs.ApplicationID
+       LEFT JOIN resumeprojects rp ON a.ApplicationID = rp.ApplicationID
+       LEFT JOIN screening s       ON a.ApplicationID = s.ApplicationID
+       GROUP BY a.ApplicationID
+       ORDER BY a.ApplicationDate DESC`
+    );
+    res.json({ success: true, count: rows.length, data: rows });
+  } catch (err) { next(err); }
+};
+
+// GET /api/applications/:id  — HR
+const getApplicationById = async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const [[app]] = await pool.query(
+      `SELECT a.*, r.Qualification, r.Specialization, r.YearsOfExperience FROM application a
+       LEFT JOIN resume r ON a.ApplicationID = r.ApplicationID
+       WHERE a.ApplicationID = ?`, [id]
+    );
+    if (!app) return res.status(404).json({ success: false, message: 'Application not found' });
+
+    const [skills]    = await pool.query('SELECT Skill    FROM resumeskills   WHERE ApplicationID = ?', [id]);
+    const [projects]  = await pool.query('SELECT Project  FROM resumeprojects WHERE ApplicationID = ?', [id]);
+    const [screening] = await pool.query('SELECT * FROM screening WHERE ApplicationID = ?', [id]);
+
+    res.json({ success: true, data: { ...app, skills, projects, screening } });
+  } catch (err) { next(err); }
+};
+
+// POST /api/applications/:id/screen  — HR: create candidate from application
+// Body: { ExpectedSalary, Potential, ScreeningStatus }
+const screenApplication = async (req, res, next) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const { ExpectedSalary, Potential, ScreeningStatus } = req.body;
+    const AppID = req.params.id;
+
+    // Check application exists
+    const [[app]] = await conn.query('SELECT ApplicationID FROM application WHERE ApplicationID = ?', [AppID]);
+    if (!app) return res.status(404).json({ success: false, message: 'Application not found' });
+
+    // Check not already screened
+    const [[existing]] = await conn.query('SELECT ApplicationID FROM screening WHERE ApplicationID = ?', [AppID]);
+    if (existing) return res.status(409).json({ success: false, message: 'Application already screened' });
+
+    const CandID = await nextID('candidate', 'CandidateID');
+
+    await conn.query(
+      'INSERT INTO candidate (CandidateID, ApplicationID, ExpectedSalary, Potential) VALUES (?, ?, ?, ?)',
+      [CandID, AppID, ExpectedSalary || null, Potential || 'Medium']
+    );
+    await conn.query(
+      'INSERT INTO screening (ApplicationID, CandidateID, ScreeningStatus) VALUES (?, ?, ?)',
+      [AppID, CandID, ScreeningStatus || 'Passed']
+    );
+
+    await conn.commit();
+    res.status(201).json({ success: true, message: 'Candidate created', CandidateID: CandID });
+  } catch (err) {
+    await conn.rollback();
+    next(err);
+  } finally {
+    conn.release();
+  }
+};
+
+// PATCH /api/applications/:id  — HR: update application details
+const updateApplication = async (req, res, next) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const id = req.params.id;
+    const { FirstName, LastName, PreferredRole, Qualification, Specialization, YearsOfExperience, Skills, Projects } = req.body;
+
+    // Update main application and resume record
+    await conn.query(
+      `UPDATE application a 
+       LEFT JOIN resume r ON a.ApplicationID = r.ApplicationID
+       SET a.FirstName = COALESCE(?, a.FirstName),
+           a.LastName = COALESCE(?, a.LastName),
+           a.PreferredRole = COALESCE(?, a.PreferredRole),
+           r.Qualification = COALESCE(?, r.Qualification),
+           r.Specialization = COALESCE(?, r.Specialization),
+           r.YearsOfExperience = COALESCE(?, r.YearsOfExperience)
+       WHERE a.ApplicationID = ?`,
+      [FirstName, LastName, PreferredRole, Qualification, Specialization, YearsOfExperience, id]
+    );
+
+    // Sync Skills if provided
+    if (Array.isArray(Skills)) {
+      await conn.query('DELETE FROM resumeskills WHERE ApplicationID = ?', [id]);
+      for (const skill of Skills.filter(Boolean)) {
+        await conn.query('INSERT INTO resumeskills (ApplicationID, Skill) VALUES (?, ?)', [id, skill]);
+      }
+    }
+
+    // Sync Projects if provided
+    if (Array.isArray(Projects)) {
+      await conn.query('DELETE FROM resumeprojects WHERE ApplicationID = ?', [id]);
+      for (const project of Projects.filter(Boolean)) {
+        await conn.query('INSERT INTO resumeprojects (ApplicationID, Project) VALUES (?, ?)', [id, project]);
+      }
+    }
+
+    await conn.commit();
+    res.json({ success: true, message: 'Application updated successfully' });
+  } catch (err) {
+    if (conn) await conn.rollback();
+    next(err);
+  } finally {
+    conn.release();
+  }
+};
+
+// DELETE /api/applications/:id
+const deleteApplication = async (req, res, next) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const id = req.params.id;
+
+    // 1. Clear up everything associated with candidates derived from this application
+    const [cands] = await conn.query('SELECT CandidateID FROM candidate WHERE ApplicationID = ?', [id]);
+    for (const c of cands) {
+        const cid = c.CandidateID;
+        await conn.query('DELETE FROM employeetraining WHERE CandidateID = ?', [cid]);
+        await conn.query('DELETE FROM training      WHERE CandidateID = ?', [cid]);
+        await conn.query('DELETE FROM awarded       WHERE CandidateID = ?', [cid]);
+        await conn.query('DELETE FROM offer         WHERE CandidateID = ?', [cid]);
+        await conn.query('DELETE FROM interview     WHERE CandidateID = ?', [cid]);
+        await conn.query('DELETE FROM employeecandidate WHERE CandidateID = ?', [cid]);
+        await conn.query('DELETE FROM screening     WHERE CandidateID = ?', [cid]);
+        await conn.query('DELETE FROM candidate     WHERE CandidateID = ?', [cid]);
+    }
+
+    // 2. Clear screening, resume logic
+    await conn.query('DELETE FROM screening      WHERE ApplicationID = ?', [id]);
+    await conn.query('DELETE FROM resumeprojects  WHERE ApplicationID = ?', [id]);
+    await conn.query('DELETE FROM resumeskills    WHERE ApplicationID = ?', [id]);
+    await conn.query('DELETE FROM resume         WHERE ApplicationID = ?', [id]);
+    const [result] = await conn.query('DELETE FROM application    WHERE ApplicationID = ?', [id]);
+    
+    await conn.commit();
+    if (result.affectedRows === 0) return res.status(404).json({ success: false, message: 'Application not found' });
+    res.json({ success: true, message: 'Application and all related data deleted' });
+  } catch (err) {
+    if (conn) await conn.rollback();
+    next(err);
+  } finally {
+    conn.release();
+  }
+};
+
+module.exports = { submitApplication, getAllApplications, getApplicationById, screenApplication, updateApplication, deleteApplication };
+
